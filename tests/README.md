@@ -534,5 +534,5 @@ GQA 56/8, position 262143 and 262144-key cache, with both 1024- and 8192-key seg
 is an equivalent fixture carrying a real tokenizer and cases.
 `ninfer_llama_real_test` is manual because the full artifact needs a V100-sized device and the
 capacity case needs 52 GiB of RAM. See [the model guide](../docs/llama.md#qualification) for its
-`logits`, `state` and `capacity` modes and the limits of the resulting evidence. Conversion tests
+`logits`, `state`, `state-boundary`, `capacity-fast` and `capacity` modes and the limits of the resulting evidence. Conversion tests
 run with Python 3.11: `python3.11 -m pytest tests/convert/test_llama.py`.

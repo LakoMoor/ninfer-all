@@ -22,17 +22,22 @@ int main(int argc, char** argv) {
         device.synchronize();
         models::llama::ExecutorOptions options;
         options.max_context =
-            std::min<std::uint32_t>(262144, model->config().max_position_embeddings);
+            std::min<std::uint32_t>(std::string_view(argv[2]) == "capacity-fast" ? 8192 : 262144,
+                                    model->config().max_position_embeddings);
         models::llama::Executor executor(*model, device, options);
-        if (std::string_view(argv[2]) == "state") {
+        if (std::string_view(argv[2]) == "state" || std::string_view(argv[2]) == "state-boundary") {
             if (argc != 4) throw std::invalid_argument("state requires ids.json");
             std::ifstream input(argv[3]);
             nlohmann::json ids;
             input >> ids;
             auto tokens                  = ids.get<std::vector<std::int32_t>>();
-            constexpr std::uint32_t base = 1023, tail = 17;
+            const std::uint32_t base     = std::string_view(argv[2]) == "state-boundary"
+                                               ? executor.options().resident_tokens - 1
+                                               : 1023;
+            constexpr std::uint32_t tail = 17;
             if (tokens.size() < base + tail)
-                throw std::invalid_argument("state needs 1040 input tokens");
+                throw std::invalid_argument(
+                    "state input must cover its resident boundary plus 17 tokens");
             for (std::size_t at = 0; at < base; at += options.prefill_chunk) {
                 auto n = std::min<std::size_t>(options.prefill_chunk, base - at);
                 executor.forward(0, std::span(tokens).subspan(at, n), 0);
@@ -80,8 +85,10 @@ int main(int argc, char** argv) {
                 !std::equal(second.begin(), second.end(), branches.begin() + first.size()))
                 throw std::runtime_error("branch read changed logits or prefix position");
             std::cout << "snapshot, host image and branches preserve exact BF16 continuation "
-                         "logits across position 1024\n";
-        } else if (std::string_view(argv[2]) == "capacity") {
+                         "logits across position "
+                      << base + 1 << "\n";
+        } else if (std::string_view(argv[2]) == "capacity" ||
+                   std::string_view(argv[2]) == "capacity-fast") {
 
             constexpr std::size_t page_bytes = 8u << 20;
             PinnedHostBuffer zero(page_bytes);
@@ -94,7 +101,7 @@ int main(int argc, char** argv) {
             std::cout << "host KV backed " << executor.memory().host_kv_bytes
                       << " bytes at position " << executor.position(0) << std::endl;
             const auto decode_start = std::chrono::steady_clock::now();
-            const std::int32_t id = 0;
+            const std::int32_t id   = 0;
             executor.forward(0, {&id, 1}, 1);
             std::cout << "full-cache one-token seconds "
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() -

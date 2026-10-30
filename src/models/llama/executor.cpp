@@ -35,7 +35,7 @@ std::int64_t row_bytes(const Weight& w) {
 struct Layer {
     Weight q, k, v, o, gate, up, down;
     const float *input_norm = nullptr, *ffn_norm = nullptr;
-    // The first physical cache page stays on device. Remaining pages stream through one
+    // A prefix sized to free VRAM stays on device. Remaining pages stream through one
     // bounded transfer buffer; host pages are allocated only when a sequence reaches them.
     DeviceBuffer resident;
     std::vector<std::unique_ptr<std::byte[]>> pages;
@@ -55,7 +55,8 @@ struct Executor::Impl {
     std::unique_ptr<WorkspaceArena> workspace;
     DeviceBuffer ids, positions, logit_buffer, segment;
     std::unique_ptr<PinnedHostBuffer> updates, upload;
-    std::size_t plane_bytes, page_bytes, update_plane;
+    std::size_t plane_bytes, page_bytes, update_plane, resident_plane_bytes = 0, resident_bytes = 0;
+    int resident_slots = 0;
 
     Impl(const Model& m, DeviceContext&, ExecutorOptions o)
         : model(m), options(o), h(m.config().hidden_size), hq(m.config().num_attention_heads),
@@ -82,6 +83,30 @@ struct Executor::Impl {
             updates =
                 std::make_unique<PinnedHostBuffer>(std::size_t(layers_count) * 2 * update_plane);
             upload = std::make_unique<PinnedHostBuffer>(page_bytes * (kStage / kPage));
+            std::size_t free_bytes = 0, total_bytes = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            constexpr std::size_t reserve = 256ull << 20;
+            const std::size_t page_cost   = page_bytes * layers_count;
+            const std::size_t fit_pages =
+                free_bytes > reserve ? (free_bytes - reserve) / page_cost : 0;
+            const std::size_t requested = (std::size_t(o.max_context) + kPage - 1) / kPage;
+            std::size_t pages           = std::min(fit_pages, requested);
+            if (o.resident_tokens) {
+                if (o.resident_tokens % kPage)
+                    throw std::invalid_argument(
+                        "Llama resident KV must use whole 1024-token pages");
+                pages = o.resident_tokens / kPage;
+                if (pages > fit_pages || pages > requested)
+                    throw std::invalid_argument(
+                        "Llama resident KV exceeds context or free device memory");
+            }
+            if (!pages)
+                throw std::runtime_error(
+                    "Llama: insufficient device memory for resident KV and 256 MiB headroom");
+            resident_slots          = int(pages * kPage);
+            options.resident_tokens = resident_slots;
+            resident_plane_bytes    = std::size_t(resident_slots) * kv * 2;
+            resident_bytes          = 2 * resident_plane_bytes;
             for (const auto& w : m.weights().layers) {
                 Layer p{.q          = matrix(m, w.attention.query),
                         .k          = matrix(m, w.attention.key),
@@ -92,7 +117,7 @@ struct Executor::Impl {
                         .down       = matrix(m, w.mlp_down),
                         .input_norm = vector(m, w.input_norm, h),
                         .ffn_norm   = vector(m, w.ffn_norm, h)};
-                p.resident = DeviceBuffer(page_bytes);
+                p.resident = DeviceBuffer(resident_bytes);
                 p.resident.fill(0);
                 layers.push_back(std::move(p));
             }
@@ -159,16 +184,19 @@ struct Executor::Impl {
                     static_cast<__nv_bfloat16*>(out.data) + std::size_t(row) * hq * 128, stream);
             }
         };
-        bool first = true;
-        if (pos) {
-            auto* base = static_cast<const std::byte*>(l.resident.p);
-            run(reinterpret_cast<const __half*>(base),
-                reinterpret_cast<const __half*>(base + plane_bytes), 0,
-                std::min<std::uint32_t>(pos, kPage), kPage, true, false);
+        bool first                = true;
+        const auto resident_count = std::min<std::uint32_t>(pos, resident_slots);
+        const auto* resident      = static_cast<const std::byte*>(l.resident.p);
+        for (std::uint32_t at = 0; at < resident_count; at += kStage) {
+            const int n = std::min<std::uint32_t>(kStage, resident_count - at);
+            run(reinterpret_cast<const __half*>(resident) + std::size_t(at) * 128,
+                reinterpret_cast<const __half*>(resident + resident_plane_bytes) +
+                    std::size_t(at) * 128,
+                at, n, resident_slots, first, false);
             first = false;
         }
         const std::size_t stage_plane = std::size_t(kStage) * kv * 2;
-        for (std::uint32_t at = kPage; at < pos; at += kStage) {
+        for (std::uint32_t at = resident_slots; at < pos; at += kStage) {
             const int n = std::min<std::uint32_t>(kStage, pos - at);
             // A whole transfer tile amortizes stream/driver overhead. Query subtiles keep the
             // split-softmax workspace bounded independently of the projection's prompt chunk.
@@ -188,8 +216,8 @@ struct Executor::Impl {
                         done += take;
                     }
                 }
-            CUDA_CHECK(
-                cudaMemcpyAsync(segment.p, host, 2 * stage_plane, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(segment.p, kStage * 256, host, kStage * 256, n * 256,
+                                         2 * hk, cudaMemcpyHostToDevice, stream));
             auto* base = static_cast<const std::byte*>(segment.p);
             run(reinterpret_cast<const __half*>(base),
                 reinterpret_cast<const __half*>(base + stage_plane), at, n, kStage, first, false);
@@ -270,14 +298,14 @@ struct Executor::Impl {
                                        stream));
             CUDA_CHECK(cudaMemcpyAsync(update + update_plane, v, std::size_t(t) * kv * 2,
                                        cudaMemcpyDeviceToHost, stream));
-            if (pos < kPage) {
-                int n          = std::min<std::uint32_t>(t, kPage - pos);
+            if (pos < std::uint32_t(resident_slots)) {
+                int n          = std::min<std::uint32_t>(t, resident_slots - pos);
                 auto* resident = static_cast<std::byte*>(l.resident.p);
-                CUDA_CHECK(cudaMemcpy2DAsync(resident + pos * 256, kPage * 256, k, t * 256, n * 256,
-                                             hk, cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaMemcpy2DAsync(resident + plane_bytes + pos * 256, kPage * 256, v,
-                                             t * 256, n * 256, hk, cudaMemcpyDeviceToDevice,
-                                             stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(resident + pos * 256, resident_slots * 256, k, t * 256,
+                                             n * 256, hk, cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(resident + resident_plane_bytes + pos * 256,
+                                             resident_slots * 256, v, t * 256, n * 256, hk,
+                                             cudaMemcpyDeviceToDevice, stream));
             }
         }
         if (logit_rows) {
@@ -302,10 +330,17 @@ struct Executor::Impl {
     }
 
     void rebuild_resident() {
+        const auto count = std::min<std::uint32_t>(pos, resident_slots);
         for (auto& l : layers)
-            if (pos) {
-                CUDA_CHECK(cudaMemcpyAsync(l.resident.p, page(l, 0), page_bytes,
-                                           cudaMemcpyHostToDevice, stream));
+            for (std::uint32_t at = 0; at < count; at += kPage) {
+                const int n = std::min<std::uint32_t>(kPage, count - at);
+                auto* src   = page(l, at / kPage);
+                auto* dst   = static_cast<std::byte*>(l.resident.p);
+                for (int plane = 0; plane < 2; ++plane)
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        dst + plane * resident_plane_bytes + std::size_t(at) * 256,
+                        resident_slots * 256, src + plane * plane_bytes, kPage * 256, n * 256, hk,
+                        cudaMemcpyHostToDevice, stream));
             }
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
@@ -320,7 +355,7 @@ const ExecutorOptions& Executor::options() const noexcept { return impl_->option
 
 ExecutorMemory Executor::memory() const noexcept {
     ExecutorMemory m;
-    m.kv_bytes        = impl_->page_bytes * impl_->layers.size();
+    m.kv_bytes        = impl_->resident_bytes * impl_->layers.size();
     m.kv_backed_bytes = m.kv_bytes;
     m.workspace_bytes = impl_->workspace->capacity() + impl_->segment.bytes + impl_->ids.bytes +
                         impl_->positions.bytes + impl_->logit_buffer.bytes;

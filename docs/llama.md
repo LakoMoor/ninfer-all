@@ -50,8 +50,10 @@ and other stored formats rather than receiving one uniform three-bit codec.
 A 262144-token F16 KV cache needs **52 GiB of system RAM**, plus weights, staging and runtime
 resources. Reserve enough RAM for that cache independently of `--host-cache-mib`, which bounds
 additional prefix images. Active KV uses pageable host pages allocated as the sequence grows;
-only the first 1024 positions remain cached on the GPU. The other rows are gathered into bounded 8192-token
-pinned transfer tiles and copied to the GPU, where all attention arithmetic runs. Query subtiles
+an initial prefix sized to available VRAM remains cached on the GPU, retaining 256 MiB
+of planning headroom. The other rows are gathered into bounded 8192-token
+pinned transfer tiles and copied to the GPU, where all attention arithmetic runs. Partial tiles transfer only
+their populated rows. Query subtiles
 bound workspace independently of transfer size and projection chunk size. Full-prefix snapshots
 retain a frontier; saved images contain the represented F16 bytes.
 
@@ -101,8 +103,61 @@ attention/transfer overhead. It has no measured long-context speed advantage ove
 optimized implementation.
 
 The deployed server OpenCode provider uses `http://127.0.0.1:8000/v1`, selects
-`ninfer/nanbeige4.3-33b`, and declares context 262144/output 8192. An actual OpenCode run called
+`ninfer/nanbeige4.3-33b`; the original profile declared context 262144/output 8192, while
+the deployed fast profile declares context 8192/output 2048. An actual OpenCode run called
 its `read` tool on a local fixture and returned `NINFER_TOOLCHECK_OK` (exit 0). The standalone
 launcher is [scripts/start-nanbeige-v100-256k.sh](../scripts/start-nanbeige-v100-256k.sh); on the
 server it is also installed as `/workspace/start-nanbeige-256k.sh`. The existing model router
 uses its own launcher and loads Nanbeige on startup while retaining the two Qwen choices.
+
+## Fast interactive profile
+
+```sh
+sh scripts/start-nanbeige-v100-fast.sh
+```
+
+This profile uses max-context/kv-capacity 8192, concurrency 1, prefill chunk 512, host prefix-image
+budget 2048 MiB, context lookup with a four-token match and three automatic drafts, no CUDA Graphs,
+thinking disabled by default and default output budget 2048. A request can explicitly enable
+thinking. Disabling reasoning changes the default answering policy, not the underlying decode
+rate; both sides of the measurements below explicitly disabled it. The weights remain the same
+IQ3_XXS artifact without further quantization.
+
+The original executor held exactly 1024 KV positions on GPU and copied the entire 8192-position
+staging allocation even for a partial tile. The optimized executor fits whole 1024-position pages
+to free VRAM after allocating its bounded workspace, reserving 256 MiB at planning. Attention
+uses the actual resident stride, image reload restores every resident page, and a 2D transfer
+uploads only the populated rows of each K/V head. The deployed V100 selected 4096 resident
+positions. This raised device KV from 208 MiB to 832 MiB; startup reported 377.5 MiB free. The
+prefix-image RAM budget rose from 512 MiB to 2 GiB, separately from active KV (at most 1.625 GiB
+at 8k). These resource costs buy less PCIe traffic and longer reusable OpenCode prefixes.
+
+Measurements on the same V100, artifact, greedy sampling/seed, cache reuse disabled, code/prose
+outputs truncated at 160 tokens; two runs per short workload:
+
+| Workload | Original fixed-1024 KV, no lookup | Final fast 8k profile |
+| --- | --- | --- |
+| LRU-cache code, 57-token prompt | 32.32 / 32.32 tok/s | 32.30 / 32.32 tok/s |
+| Russian HTTP-cache explanation, 70-token prompt | 31.79 / 31.78 tok/s | 31.49 / 31.50 tok/s |
+| Repeated square functions | 31.92 / 31.90 tok/s | 51.30 / 51.35 tok/s |
+| 2048-token reference continuation, 32 output tokens | 4.44 tok/s | 36.86 tok/s |
+| 6144-token reference continuation, 32 output tokens | 2.56 tok/s | 13.28 tok/s |
+
+Every measured greedy output matched the baseline exactly. The context-continuation prompts are
+repetitive and favor lookup; their gains cannot be generalized to arbitrary prose at the same
+length. The code/prose and reference-continuation cases use different input shapes and output
+lengths, so compare each row only with its own baseline. The ordinary prose slowdown of about
+0.9% remains visible; the profile was selected for its substantial repeat/code and resident-prefix
+gains, not a universal TPS improvement. No stable 60+ tok/s claim is supported.
+
+A residency-only trial with 3072 GPU positions (a second idle server retained a CUDA context)
+gave 24.27 tok/s at 2k and 4.76 tok/s at 6k; adding lookup gave 37.10 and 10.13 tok/s. That was a
+selection trial, not an alternative final baseline. Explicit --draft-tokens without a separate
+--spec backend is rejected by the existing CLI; this profile uses lookup's automatic three drafts.
+
+Expanded-cache qualification passed exact snapshot/image/branch continuation checks across
+positions 1024, 3072 and 4096. The 1537-token full-model logits retained the earlier reference KL
+2.50e-6 and the same top token. The fast-capacity test backed 1744830464 host-KV bytes, executed
+position 8191 with finite logits in 0.550 s (synthetic cache, plain decode), and rejected position
+8192. The original full 256k capacity result above predates this residency change; a complete real
+256k prompt remains untested. This fast profile intentionally limits the request window to 8k.

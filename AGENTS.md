@@ -69,8 +69,9 @@ family for bias-free, untied, SiLU dense blocks with D128 heads and unscaled RoP
 Nanbeige4.3-33B. Its GGUF converter reverses the Q/K rotary-pair row permutation into NeoX order
 without requantizing blocks. It shares the frontend with Metaspace-first BPE and the release's
 ChatML/XML-tool template. One active sequence runs eagerly in chunks up to 512 tokens; context
-lookup is optional. F16 active KV grows in pageable host pages, its first 1024 positions cached
-on the GPU and the rest staged through bounded pinned/device buffers. All attention arithmetic
+lookup is optional. F16 active KV grows in pageable host pages, a prefix sized to free VRAM cached
+on the GPU (256 MiB planning headroom) and the rest staged through bounded pinned/device buffers.
+Only populated rows cross PCIe, including a partial transfer tile. All attention arithmetic
 stays on CUDA. At 262144 positions Nanbeige's host KV is 52 GiB; this is separate from bounded
 prefix-image storage. No vision, scaled RoPE, separate draft model or multi-GPU path. Limits and
 qualification evidence are in `docs/llama.md`.

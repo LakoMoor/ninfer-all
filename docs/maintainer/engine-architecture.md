@@ -61,7 +61,8 @@ Frontend，只在一个 GPU 上运行。
 
 Dense Llama/Nanbeige (`models/llama`, `runtime/engine/llama_core`) also owns explicit load and
 execution. Its single active sequence stores F16 KV in pageable host pages and runs attention on
-CUDA through bounded pinned/device staging, with the first 1024 positions resident. It shares the
+CUDA through bounded pinned/device staging, with an initial prefix sized to free VRAM resident (256 MiB planning headroom).
+Only populated rows of a transfer tile are uploaded. It shares the
 frontend through Metaspace-first BPE and the release's ChatML template; it uses eager execution.
 
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。

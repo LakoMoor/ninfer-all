@@ -7,6 +7,9 @@
 namespace ninfer::models::llama {
 struct ExecutorOptions {
     std::uint32_t max_context = 262144, prefill_chunk = 512, sequences = 1, draft_tokens = 0;
+    // Zero selects as many whole host pages as fit after workspace, retaining device headroom.
+    // Explicit sizes are useful for qualifying the resident/streamed boundary.
+    std::uint32_t resident_tokens = 0;
     bool cuda_graphs = false, checkpoints = true;
 };
 

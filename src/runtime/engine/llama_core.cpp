@@ -151,9 +151,10 @@ ConstructedLlama construct_llama(const EngineOptions& options, DeviceContext& de
     rope.summary.native_context = model->config().max_position_embeddings;
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Llama: one sequence, chunks %u, F16 KV in lazily allocated RAM pages; "
-                       "first 1024 tokens cached on GPU; "
+                       "first %u tokens cached on GPU; "
                        "context %u, full host cache %.1f GiB; streamed calls run eagerly",
-                       executor.prefill_chunk, options.max_context,
+                       executor.prefill_chunk, instance->executor->options().resident_tokens,
+                       options.max_context,
                        double(instance->executor->image_bytes(options.max_context)) / 1073741824.0);
     ConstructedLlama out;
     const auto& stats     = model->storage_stats();
